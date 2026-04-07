@@ -1,0 +1,199 @@
+name: Sync and Build DXC
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 6am UTC
+  workflow_dispatch:       # Manual trigger
+
+jobs:
+  check-upstream:
+    runs-on: ubuntu-latest
+    outputs:
+      new_tag: ${{ steps.check.outputs.new_tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check for new upstream release
+        id: check
+        run: |
+          LATEST=$(git ls-remote --tags --sort=-v:refname \
+            https://github.com/microsoft/DirectXShaderCompiler.git \
+            'refs/tags/v*' | head -1 | sed 's/.*refs\/tags\///')
+          echo "Latest upstream tag: ${LATEST}"
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${LATEST}")
+
+          if [ "$STATUS" = "404" ]; then
+            echo "New tag found: ${LATEST}"
+            echo "new_tag=${LATEST}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Already have release for ${LATEST}, skipping."
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.new_tag != ''
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            os: windows
+            arch: x86_64
+          - runner: ubuntu-latest
+            os: linux
+            arch: x86_64
+          - runner: macos-14
+            os: macos
+            arch: arm64
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - name: Checkout upstream at tag
+        uses: actions/checkout@v4
+        with:
+          repository: microsoft/DirectXShaderCompiler
+          ref: ${{ needs.check-upstream.outputs.new_tag }}
+          submodules: recursive
+
+      # ── Toolchain setup ──
+
+      - name: Setup MSVC
+        if: matrix.os == 'windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Install deps (Windows)
+        if: matrix.os == 'windows'
+        run: choco install ninja
+
+      - name: Install deps (Linux)
+        if: matrix.os == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y cmake ninja-build
+
+      - name: Install deps (macOS)
+        if: matrix.os == 'macos'
+        run: brew install cmake ninja
+
+      # ── Build (unified across all platforms) ──
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -C cmake/caches/PredefinedParams.cmake
+          -DCMAKE_BUILD_TYPE=Release
+          -DHLSL_BUILD_DXILCONV=OFF
+          -DHLSL_INCLUDE_TESTS=OFF
+          -DLLVM_INCLUDE_TESTS=OFF
+          -DCLANG_INCLUDE_TESTS=OFF
+          -DHLSL_OFFICIAL_BUILD=ON
+          -DLLVM_ENABLE_ZLIB=OFF
+          -G Ninja
+
+      - name: Build
+        run: cmake --build build
+
+      # ── Stage files for upload ──
+      # We upload the raw directory (no zip/tar) so the package job
+      # can combine all platforms into a single archive.
+
+      - name: Stage (Windows)
+        if: matrix.os == 'windows'
+        shell: pwsh
+        run: |
+          $dir = "staged/${{ matrix.os }}-${{ matrix.arch }}"
+          New-Item -ItemType Directory -Path "$dir/bin", "$dir/lib", "$dir/include" -Force
+
+          Copy-Item build/bin/dxc.exe          "$dir/bin/"
+          Copy-Item build/bin/dxcompiler.dll    "$dir/bin/"
+          Copy-Item build/lib/dxcompiler.lib    "$dir/lib/" -ErrorAction SilentlyContinue
+          Copy-Item -Recurse include/dxc        "$dir/include/"
+
+      - name: Stage (Linux)
+        if: matrix.os == 'linux'
+        run: |
+          DIR="staged/${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "${DIR}/bin" "${DIR}/lib" "${DIR}/include"
+
+          cp build/bin/dxc                  "${DIR}/bin/"
+          cp build/lib/libdxcompiler.so     "${DIR}/lib/"
+          cp -r include/dxc                 "${DIR}/include/"
+
+      - name: Stage (macOS)
+        if: matrix.os == 'macos'
+        run: |
+          DIR="staged/${{ matrix.os }}-${{ matrix.arch }}"
+          mkdir -p "${DIR}/bin" "${DIR}/lib" "${DIR}/include"
+
+          cp build/bin/dxc                      "${DIR}/bin/"
+          cp build/lib/libdxcompiler.dylib      "${DIR}/lib/"
+          cp -r include/dxc                     "${DIR}/include/"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxc-${{ matrix.os }}-${{ matrix.arch }}
+          path: staged/${{ matrix.os }}-${{ matrix.arch }}
+
+  package:
+    needs: [check-upstream, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: platforms
+
+      - name: Create combined zip
+        run: |
+          TAG="${{ needs.check-upstream.outputs.new_tag }}"
+          ROOT="dxc-${TAG}"
+          mkdir -p "${ROOT}"
+
+          # Each artifact downloads into platforms/<artifact-name>/
+          # Move them into the combined directory
+          for dir in platforms/dxc-*/; do
+            PLATFORM=$(basename "$dir" | sed "s/^dxc-//")
+            cp -r "$dir" "${ROOT}/${PLATFORM}"
+          done
+
+          echo "Combined archive contents:"
+          find "${ROOT}" -type f
+
+          zip -r "dxc-${TAG}.zip" "${ROOT}"
+
+      - name: Upload combined artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dxc-combined
+          path: dxc-${{ needs.check-upstream.outputs.new_tag }}.zip
+
+  release:
+    needs: [check-upstream, package]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dxc-combined
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.check-upstream.outputs.new_tag }}
+          name: "DXC ${{ needs.check-upstream.outputs.new_tag }}"
+          body: |
+            Cross-platform binaries for DirectXShaderCompiler [`${{ needs.check-upstream.outputs.new_tag }}`](https://github.com/microsoft/DirectXShaderCompiler/releases/tag/${{ needs.check-upstream.outputs.new_tag }}).
+
+            See the [README](https://github.com/${{ github.repository }}#readme) for archive layout and build details.
+          files: artifacts/*
